@@ -1,0 +1,644 @@
+<?php
+/**
+ *  @file
+ *  CNC Ex Product Loader
+ */
+
+// CRON Run
+// wget -O - -q -t 1 https://www.cncexchange.com/cron/eXVyG7lhM6-j8KDhV8sPZQbAtM60o-0qdOjLDVlkTdCDt7HmhCQOqp3yq9ouaRzWeu5Cl9H7ww
+
+
+// namespace Drupal\cncexproducts\Controller;
+use Drupal\Core\Controller\ControllerBase;
+use Drupal\taxonomy\Entity\Term;
+use Drupal\file\Entity\File;
+use Drupal\node\Entity\Node;
+use Drupal\Core\Database\Connection;
+
+
+
+function cncex_loader_cron() {
+     \Drupal::lock()->release('cron');
+    // Force delete of cron lock
+    $query = \Drupal::database()->delete('ultimate_cron_lock');
+    $query->condition('name', 'cncex_loader_cron');
+    $query->execute();
+
+
+    // Salesforce Credentials
+    $cncexsf = \Drupal::state()->get('cncexsf');
+    $sfCred = json_decode($cncexsf);
+
+    // Extract WSDL Product Fields
+    if (strlen($sfCred->cncexsf_wsdl) > 0) {
+      $defaultFile = \Drupal::entityTypeManager()->getStorage('file')->loadByProperties(['uri' => $sfCred->cncexsf_wsdl]);;
+      foreach ($defaultFile as $key => $image) {
+        $fid = $key;
+      }
+
+        // Connect to Salesforce
+        if (isset($sfCred)) {
+          $SFbuilder = new \Phpforce\SoapClient\ClientBuilder(
+            $sfCred->cncexsf_wsdl,
+            $sfCred->cncexsf_user,
+            $sfCred->cncexsf_pass,
+            $sfCred->cncexsf_api
+          );
+          $client = $SFbuilder->build();
+
+          // Grab Fields from Salesforce Object
+          $fields = $client->describeSObjects(array('Product2'));
+          $var = $fields[0]->getFields()->toArray();
+
+          // Create Salesforce Fields Array
+          foreach ($var as $key => $value) {
+            $sfFields[] = $value->getName();
+          }
+
+          // Set Image Name Pattern
+          $alpha = range('a', 'z');
+
+          // Query Salesforce
+          $sfIds = [];
+          $salesforceIDS = [];
+          $results = $client->query("SELECT Id, IsActive, CreatedDate, LastModifiedDate FROM Product2");
+          foreach ($results as $key => $row) {
+            if ($row->IsActive == 1) {
+
+              unset($LastModifiedDate);
+              foreach ($row->LastModifiedDate as $dkey => $dvalue) {
+                if ($dkey == 'date') {
+                  $LastModifiedDate = $dvalue;
+                }
+              }
+
+              // Salesforce Product Array
+              $sfIds[] = [
+                          $row->Id,
+                          date('U', strtotime($LastModifiedDate))
+                        ];
+
+              $salesforceIDS[] = $row->Id;
+            } // active
+          } // $results
+        } // $sfCred
+      } // cncexsf_wsdl
+
+        $drupalProducts = [];
+        $query = db_select('node__field_salesforce_id', 's');
+        $query->join('node__field_last_modified', 'm', 's.entity_id = m.entity_id');
+        $drupalProducts = $query
+          ->fields('s', array('entity_id', 'field_salesforce_id_value'))
+          ->fields('m', array('entity_id', 'field_last_modified_value'))
+          ->execute()->fetchAll();
+
+       // Array of all Products in Drupal
+       foreach ($drupalProducts as $dpkey => $dpvalue) {
+          $dProductList[] = $dpvalue->field_salesforce_id_value;
+        }
+
+      // New Product Array
+      $sfNew = [];
+      $sfRem = [];
+      foreach ($sfIds as $key => $value) {
+        if (!isset($dProductList) ||
+            !in_array($value[0], $dProductList)) {
+          $sfNew[] = $value[0];
+        }
+      }
+
+      // Products to Remove
+      foreach ($drupalProducts as $key => $value) {
+        if (!in_array($value->field_salesforce_id_value, $salesforceIDS)) {
+          $sfRem[] = $value->entity_id;
+        }
+      }
+
+      removeOLD($sfRem);
+
+      // Products to Edit (Modified Date is changed)
+      $editIds = [];
+      foreach ($drupalProducts as $dkey => $dvalue) {
+        foreach ($sfIds as $skey => $svalue) {
+          if ($dvalue->field_salesforce_id_value == $svalue[0]) {
+            if ($dvalue->field_last_modified_value <> $svalue[1]) {
+              $editIds[] = $dvalue->entity_id;
+            }
+          }
+        }
+      }
+
+      $editSF = [];
+      foreach ($editIds as $key => $nid) {
+        $node_storage = \Drupal::entityTypeManager()->getStorage('node');
+        $node = $node_storage->load($nid);
+        $editSF[] = $node->get('field_salesforce_id')->value;
+      }
+
+          // ### IDs IN SALESFORCE
+          // PRODUCTS
+          $Id = '';
+
+          foreach ($sfNew as $idKey => $idValue) {
+            $Id .= "'" . $idValue . "',";
+          }
+          foreach ($editSF as $idKey => $idValue) {
+            $Id .= "'" . $idValue . "',";
+          }
+
+             $Id = substr(trim($Id), 0, -1);
+
+
+
+          $objects = ['Product2' => 'Id'];
+
+
+          foreach ($objects as $table => $field) {
+
+            $sfFields = [];
+            $Fields = '';
+
+            $fields = $client->describeSObjects(array($table));
+            $var = $fields[0]->getFields()->toArray();
+
+            foreach ($var as $key => $value) {
+              $sfFields[] = $value->getName();
+            }
+
+            foreach ($sfFields as $fieldKey => $fieldValue) {
+              $Fields .= $fieldValue . ', ';
+            }
+            $Fields = substr(trim($Fields), 0, -1);
+
+        $InIds = '';
+
+
+        $InIds = $Id;
+        $product['type'] = 'product';
+        $productFields = productFields_loader('product');
+        $title = 'field_stock_number';
+
+
+      // Create Product Array
+      if (strlen($InIds) > 0) {
+      $results = $client->query("SELECT " . $Fields . " FROM " . $table . " WHERE " . $field . " in (" . $InIds . ")");
+      // \Drupal::logger('cncex_loader')->notice(print_r($results, TRUE));
+       foreach ($results as $key => $row) {
+          $return = [];
+          foreach ($sfFields as $fieldKey => $fieldValue) {
+            foreach ($productFields as $pfield => $pvalue) {
+              if ($pfield == $fieldValue) {
+                if ($fieldValue == 'LastModifiedDate') {
+                  foreach ($row->{$fieldValue} as $dkey => $dvalue) {
+                    if ($dkey == 'date') {
+                      $return[$pvalue] = date('U', strtotime($dvalue));
+                    }
+                  }
+                }
+                 else {
+                   if (isset( $row->{$fieldValue})) {
+                     $return[$pvalue] = $row->{$fieldValue};
+                   }
+                 }
+              }
+            }
+          }
+
+
+          foreach ($return as $field_name => $field_value) {
+              $product[$field_name] = $field_value;
+          }
+
+          $product['title'] = $product[$title];
+
+          /**
+           * ### IMAGE LOADER ###
+           */
+          $imageResults = $client->query("SELECT Id, OwnerId, IsDeleted, Name, CreatedDate, CreatedById, LastModifiedDate, LastModifiedById, SystemModstamp, LastViewedDate, LastReferencedDate, Machine__c, Filepath__c, Featured_Image__c, Document_ID__c, Document_Image_URL__c, test__c FROM Machine_Photo__c WHERE Machine__c IN ('" . trim($product['field_salesforce_id']) . "') ORDER BY Name ASC");
+
+          unset($data);
+          unset($file);
+
+
+            $pic = 0;
+
+         if ($table == 'Product2') {
+         unset($product['field_product_image']);
+         unset($product['field_featured_image']);
+           if (count($imageResults) > 0) {
+              foreach ($imageResults as $imgkey => $imgrow) {
+                  foreach ($imgrow as $objkey => $objvalue) {
+                      if ($objkey == 'Document_Image_URL__c') {
+                          if (strlen($objvalue) > 0) {
+                              $data = file_get_contents($objvalue);
+                              $file = file_save_data($data, 'public://' . $product['title'] . '-' . $alpha[$pic] . '.jpg', $replace = FILE_EXISTS_REPLACE);
+                              if ($pic == 0) {
+                                  $product['field_featured_image'][$pic] = [
+                                      'target_id' => $file->id(),
+                                      'alt' => $product['title'] . '-' . $pic,
+                                      'title' => $product['title'] . '-' . $pic
+                                  ];
+                              }
+                              $product['field_product_image'][$pic] = [
+                                  'target_id' => $file->id(),
+                                  'alt' => $product['title'] . '-' . $pic,
+                                  'title' => $product['title'] . '-' . $pic
+                              ];
+                              $pic++;
+                          }
+                      }
+                  }
+              }
+           }
+
+            /**
+             * ### PRODUCT LOAD IMAGE ###
+             */
+            unset($data);
+            unset($file);
+            unset($product['field_product_import_image']);
+            if (isset($product['picture']) &&
+                strlen($product['picture']) > 0) {
+                $data = file_get_contents($product['picture']);
+                $file = file_save_data($data, 'public://' . $product['title'] . '.jpg', $replace = FILE_EXISTS_REPLACE);
+                $product['field_product_import_image'] = [
+                    'target_id' => $file->id(),
+                    'alt' => $product['title'],
+                    'title' => $product['title']
+                ];
+              }
+            }
+
+            /**
+             * ### TAXONOMY ###
+             */
+            if ($table == 'Product2') {
+              if (isset($product['parent']) &&
+                  strlen($product['parent']) > 0) {
+                $machine_taxonomy = buildTaxonomy_loader($product['parent']);
+                $product['field_machine_type'] = array(array('target_id' => $machine_taxonomy));
+              }
+            }
+
+            /**
+             * ### SAVE PRODUCT ###
+             */
+            if ($table == 'Product2' && !isset($nid)) {
+                $nodeCheck = db_select('node__field_salesforce_id', 's')
+                    ->fields('s', array('entity_id'))
+                    ->condition('field_salesforce_id_value', $product['field_salesforce_id'], '=')
+                    ->execute()
+                    ->fetchObject();
+              if (is_object($nodeCheck)) {
+                $nid = $nodeCheck->entity_id;
+              }
+            }
+
+
+
+             unset($product['field_manufacturer_taxonomy']);
+             $product['field_manufacturer_taxonomy'] = $product['field_manufacturer'];
+
+             foreach ($product as $key => $value) {
+               if ($key == 'field_manufacturer_taxonomy') {
+                 $product['field_manufacturer_taxonomy'] = manufacturertid($value);
+               }
+             }
+
+            $search = [];
+            if ($table == 'Product2') {
+                foreach ($product as $pkey => $pvalue) {
+                    switch ($pkey) {
+                        case 'parent':
+                            $search[0] = [$pkey => $pvalue];
+                            break;
+                        case 'child':
+                            $search[1] = [$pkey => $pvalue];
+                            break;
+                        case 'field_stock_number':
+                            $search[2] = [$pkey => $pvalue];
+                            break;
+                        case 'field_machine_title':
+                            $search[3] = [$pkey => $pvalue];
+                            break;
+                        case 'model':
+                            $search[5] = [$pkey => $pvalue];
+                            break;
+                        case 'lot_number':
+                            $search[6] = [$pkey => $pvalue];
+                            break;
+                        case 'field_specifications':
+                            $search[7] = [$pkey => $pvalue];
+                            break;
+                    }
+                }
+                ksort($search);
+                $term = '';
+                foreach ($search as $sortedkey => $sortedvalue) {
+                    foreach ($sortedvalue as $key => $searchTerm) {
+                        $term .= preg_replace("/[\n\r]/", '', trim(strtolower($searchTerm))) . ' ';
+                    }
+                }
+
+                unset($product['field_product_search']);
+                $product['field_product_search'] = $term;
+
+            }
+
+
+            // VIDEO FIELD
+            if (isset($product['field_product_video'])) {
+                if (preg_match('/youtu\.be/', parse_url($product['field_product_video'], PHP_URL_HOST))) {
+                    $parse = preg_replace('#/#', '', parse_url($product['field_product_video'], PHP_URL_PATH));
+                    $newURL = 'https://www.youtube.com/watch?v=' . $parse;
+                    $product['field_product_video'] = $newURL;
+                }
+            }
+             else {
+              if ($table == 'Product2') {
+                $product['field_product_video'] = '';
+              }
+            }
+
+            if (isset($nid)) {
+               $fields = ['field_ad_line',
+                          'field_stock_number',
+                          'field_machine_description',
+                          'field_manufacturer_taxonomy',
+                          'field_manufacturing_year',
+                          'field_machine_serial_number',
+                          'field_specifications',
+                          'field_location',
+                          'field_website',
+                          'field_product_video',
+                          'field_machine_title',
+                          'field_machine_model',
+                          'field_machine_type',
+                          'field_product_search',
+                          'field_product_image',
+                          'field_featured_image',
+                          'field_product_import_image',
+                          'field_product_sort_index',
+                          'field_product_equipped_with',
+                          'field_last_modified'
+                        ];
+
+
+                $node = Node::load($nid);
+
+                if ($table == 'Product2') {
+                  $node->set('field_product_image', NULL);
+                  $node->set('field_featured_image', NULL);
+                  $node->set('field_product_import_image', NULL);
+                }
+
+
+                foreach ($product as $key => $value) {
+                  if (in_array($key, $fields)) {
+                      if ($key == 'field_manufacturer_taxonomy') {
+                        $saveValue = manufacturertid($value);
+                      }
+                       else {
+                         $saveValue = $value;
+                       }
+                      $node->set($key, $saveValue);
+                  }
+                }
+
+
+                $node->setPublished(TRUE);
+                $node->save();
+                $logging[] = 'update: ' . $node->id() . ' :: ' . $product['field_salesforce_id'];
+            }
+              else {
+
+                $product['uid'] = 1;
+                $product['type'] = 'product';
+
+
+                $node = \Drupal::entityTypeManager()->getStorage('node')->create($product);
+                $node->setPublished(TRUE);
+                $node->save();
+                $logging[] = 'new: ' . $node->id() . ' :: ' . $product['field_salesforce_id'];
+            }
+            unset($product);
+            unset($nid);
+            bulkLogging_loader($logging);
+            }
+          }  // Each Product
+        }  // Each Product Type
+      }  // End CRON()
+
+
+
+
+
+
+/**
+ *
+ *  Functions
+ */
+
+
+// Manufacturer TID from Name
+function manufacturertid($manufacturer) {
+  $vid = 'manufacturer';
+  $terms =\Drupal::entityTypeManager()->getStorage('taxonomy_term')->loadTree($vid);
+  foreach ($terms as $term) {
+     if (strcasecmp($term->name, $manufacturer) == 0) {
+       $tid = $term->tid;
+     }
+  }
+
+  if (!isset($tid)) {
+      $tid = 3861;
+    }
+
+  return $tid;
+}
+
+
+function removeOLD($remove) {
+  foreach($remove as $nid)
+  {
+    print $nid . "\n";
+    $node_storage = \Drupal::entityTypeManager()->getStorage('node');
+    $node = $node_storage->load($nid);
+    $node->delete();
+  }
+}
+
+function purge_loader() {
+  $inDB = [];  // Products in DB
+  $keep = [];  // Products in DB and Incoming
+  $remv = [];  // Products in DB and NOT Incoming
+
+  // $current_file_name = getdaylog_loader();
+
+  $file = file_get_contents("public://{$current_file_name}");
+
+  $product_check = db_select('node__field_salesforce_id', 's')
+      ->fields('s', array('entity_id', 'field_salesforce_id_value'))
+       ->execute();
+
+  // FIND products in Incoming
+  foreach ($product_check as $key => $value) {
+    $inDB[$value->entity_id] = $value->field_salesforce_id_value;
+      if(strpos($file, $value->field_salesforce_id_value))  {
+         $keep[$value->entity_id] = $value->field_salesforce_id_value;
+      }
+       else {
+          $remv[] = $value->entity_id;
+       }
+  }
+
+  // UNPUBLISH
+  foreach ($remv as $id => $nid) {
+    $node_storage = \Drupal::entityTypeManager()->getStorage('node');
+    $node = $node_storage->load($nid);
+    $node = $node->setPublished(FALSE);
+    $node->save();
+  }
+
+    $productCount = count($product_check);
+    $keepCount    = count($keep);
+    $removeCount  = count($remv);
+
+}
+
+function getdaylog_loader() {
+  // Set current day
+  $current_day = date('z') + 1;
+
+  // Name log
+  $current_file_name = 'snlog_' . $current_day . '.log';
+  return $current_file_name;
+}
+
+
+
+
+
+function bulkLogging_loader($logging) {
+    \Drupal::logger('cncex_loader')->notice(print_r($logging, TRUE));
+}
+
+
+function getTerm($name) {
+  // print "name: " . $name . "\n";
+  $properties['vid'] = 'machine_type';
+  $properties['name'] = $name;
+  $terms = \Drupal::entityManager()->getStorage('taxonomy_term')->loadByProperties($properties);
+
+
+    foreach ($terms as $rtid => $value) {
+      if (!isset($tid)) {
+        $tid = $rtid;
+      }
+    }
+
+  return $tid;
+}
+
+function buildTaxonomy_loader($parentItem) {
+  $parentCheck = getTerm($parentItem);
+    if ($parentCheck < 1) {
+      $parentTid = createTaxonomy_loader($parentItem, 0);
+    }
+     else {
+      $parentTid = $parentCheck;
+     }
+  return $parentTid;
+}
+
+function getTerm_loade($name) {
+  $properties['vid'] = 'machine_type';
+  $properties['name'] = $name;
+  $terms = \Drupal::entityManager()->getStorage('taxonomy_term')->loadByProperties($properties);
+    foreach ($terms as $rtid => $value) {
+      if (!isset($tid)) {
+        $tid = $rtid;
+      }
+    }
+    return $tid;
+}
+
+
+function gatherObjects_loader() {
+  // Gather Objects
+  $content = file_get_contents($sfCred->cncexsf_wsdl);
+  $xml = simplexml_load_string($content);
+  $json = json_encode($xml);
+  $array = json_decode($json,TRUE);
+
+  $objects = [];
+  foreach ($array['types']['schema'] as $key => $value) {
+    foreach ($value as $vkey => $vvalue) {
+     if ($vkey == 'complexType') {
+        foreach ($value['complexType'] as $ckey => $cvalue) {
+          foreach ($cvalue as $attr => $name) {
+            if (isset($name['name']) &&
+                strlen($name['name']) > 0) {
+                  $objects[] = $name['name'];
+            }
+          }
+        }
+      }
+    }
+  }
+  return $objects;
+}
+
+
+function createTaxonomy_loader($name, $tree) {
+    $categories_vocabulary = 'machine_type'; // Vocabulary machine name
+      $term = Term::create([
+        'parent' => array($tree),
+        'name' => $name,
+        'vid' => $categories_vocabulary,
+      ]);
+
+      $term->save();
+      return $term->id();
+}
+
+function productFields_loader($type) {
+  switch ($type) {
+    case 'product':
+       $pf = ['Id'                       => 'field_salesforce_id',
+              'Name'                     => 'field_stock_number',
+              'Description'              => 'field_machine_description',
+              'Machine_Lot_Number__c'    => 'lot_number',
+              'Machine_Capacity__c'      => 'field_capacity_1',
+              'Machine_Manufacturer__c'  => 'field_manufacturer_taxonomy',
+              'Machine_Manufacturer__c'  => 'field_manufacturer',
+              'Manufacturing_Year__c'    => 'field_manufacturing_year',
+              'Machine_Model_Number__c'  => 'field_machine_model',
+              'Machine_Serial_Number__c' => 'field_machine_serial_number',
+              'Video__c'                 => 'field_product_video',
+              'Specifications__c'        => 'field_specifications',
+              'Status_Notes__c'          => 'status',
+              'Location__c'              => 'field_location',
+              'Capacity1__c'             => 'field_capacity_1',
+              'Machine_Description__c'   => 'field_machine_description',
+              'Quote_Picutre_URL__c'     => 'picture',
+              'Website_address__c'       => 'field_website',
+              'Machine_Title__c'         => 'field_machine_title',
+              'Website_Category__c'      => 'parent',
+              'Website_Subtype__c'       => 'child',
+              'Machine_Ad_Line__c'       => 'field_ad_line',
+              'Sort_Index__c'            => 'field_product_sort_index',
+              'Equipped_With__c'         => 'field_product_equipped_with',
+              'LastModifiedDate'         => 'field_last_modified'
+              ];
+      break;
+    case 'wanted':
+       $pf = ['Id'                       => 'field_salesforce_id',
+              'Machine_Description__c'   => 'field_wanted_description',
+              'Machine_Manufacturer__c'  => 'field_wanted_manufacturer',
+              'Name'                     => 'field_wanted_number'];
+      break;
+  }
+
+  return $pf;
+}
