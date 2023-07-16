@@ -5,7 +5,7 @@
  */
 
 // CRON Run
-// wget -O - -q -t 1 https://www.cncexchange.com/cron/eXVyG7lhM6-j8KDhV8sPZQbAtM60o-0qdOjLDVlkTdCDt7HmhCQOqp3yq9ouaRzWeu5Cl9H7ww
+// wget -O - -q -t 1 <CRON_URL>
 
 
 // namespace Drupal\cncexproducts\Controller;
